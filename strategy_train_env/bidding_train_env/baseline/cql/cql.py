@@ -85,6 +85,7 @@ class CQL(nn.Module):
         self.log_alpha = torch.zeros(1, requires_grad=True)
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=actor_lr)
         self.min_q_weight = 1.0
+        self.num_random = 10
 
         self.to(self.device)
 
@@ -97,7 +98,7 @@ class CQL(nn.Module):
             nn.Linear(256, output_dim),
         )
 
-    def step(self, states: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor, next_states: torch.Tensor, dones: torch.Tensor):
+    def step(self, states: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor, next_states: torch.Tensor, dones: torch.Tensor, step_num: int = 0) -> tuple: 
         '''
         train model
         '''
@@ -124,6 +125,15 @@ class CQL(nn.Module):
         )
 
         policy_loss = (alpha * log_pi - q_new_actions).mean()
+        if step_num < 2000:
+            """
+            For the initial few epochs, try doing behaivoral cloning, if needed
+            conventionally, there's not much difference in performance with having 20k 
+            gradient steps here, or not having it
+            """
+            policy_log_prob = self.policy.compute_log_prob(actions, states)
+            policy_loss = (alpha * log_pi - policy_log_prob).mean()
+
         self.policy_optimizer.zero_grad()
         policy_loss.backward()
         self.policy_optimizer.step()
@@ -140,16 +150,24 @@ class CQL(nn.Module):
                 self.target_qf2(torch.cat([next_states, next_actions], dim=-1))
             )
             target_q_values = rewards + (1. - dones) * self.gamma * (target_q_values - alpha * next_log_pi)
+            target_q_values = target_q_values.detach()
             #print("target_q_values",target_q_values)
 
         # CQL Regularization
         # Ensure the generated action range is broader than data action range for effective training
-        random_actions = torch.FloatTensor(states.shape[0], actions.shape[-1]).uniform_(-1000, 1000).to(self.device)
-        q1_rand = self.qf1(torch.cat([states, random_actions], dim=-1))
-        q2_rand = self.qf2(torch.cat([states, random_actions], dim=-1))
+        random_actions = torch.FloatTensor(states.shape[0] * self.num_random, actions.shape[-1]).uniform_(0, 300).to(self.device)
+        curr_actions_tensor = self._get_policy_actions(states, self.num_random, self.policy)
+        next_actions_tensor = self._get_policy_actions(next_states, self.num_random, self.policy)
+        q1_rand = self._get_tensor_values(states, random_actions, self.qf1)
+        q2_rand = self._get_tensor_values(states, random_actions, self.qf2)
+        q1_curr_actions = self._get_tensor_values(states, curr_actions_tensor, self.qf1)
+        q2_curr_actions = self._get_tensor_values(states, curr_actions_tensor, self.qf2)
+        q1_next_actions = self._get_tensor_values(next_states, next_actions_tensor, self.qf1)
+        q2_next_actions = self._get_tensor_values(next_states, next_actions_tensor, self.qf2)
 
-        cat_q1 = torch.cat([q1_rand, q1_pred, q1_pred], 1)
-        cat_q2 = torch.cat([q2_rand, q2_pred, q2_pred], 1)
+
+        cat_q1 = torch.cat([q1_rand, q1_pred.unsqueeze(1), q1_curr_actions, q1_next_actions], 1)
+        cat_q2 = torch.cat([q2_rand, q2_pred.unsqueeze(1), q2_curr_actions, q2_next_actions], 1)
 
         min_qf1_loss = torch.logsumexp(cat_q1 / self.temperature,
                                        dim=1).mean() * self.min_q_weight * self.temperature - q1_pred.mean() * self.min_q_weight
@@ -160,15 +178,18 @@ class CQL(nn.Module):
         diff1 = target_q_values - q1_pred
         diff2 = target_q_values - q2_pred
 
-        qf1_loss = torch.where(diff1 > 0, self.expectile * diff1 ** 2, (1 - self.expectile) * diff1 ** 2).mean() + min_qf1_loss
-        qf2_loss = torch.where(diff2 > 0, self.expectile * diff2 ** 2, (1 - self.expectile) * diff2 ** 2).mean() + min_qf2_loss
+        qf1_loss = torch.nn.MSELoss()(q1_pred, target_q_values) + min_qf1_loss
+        qf2_loss = torch.nn.MSELoss()(q2_pred, target_q_values) + min_qf2_loss
+
+        #qf1_loss = torch.where(diff1 > 0, self.expectile * diff1 ** 2, (1 - self.expectile) * diff1 ** 2).mean() + min_qf1_loss
+        #qf2_loss = torch.where(diff2 > 0, self.expectile * diff2 ** 2, (1 - self.expectile) * diff2 ** 2).mean() + min_qf2_loss
 
         self.qf1_optimizer.zero_grad()
-        qf1_loss.backward()
+        qf1_loss.backward(retain_graph=True)
         self.qf1_optimizer.step()
 
         self.qf2_optimizer.zero_grad()
-        qf2_loss.backward()
+        qf2_loss.backward(retain_graph=True)
         self.qf2_optimizer.step()
 
         # Soft update target networks
@@ -209,14 +230,14 @@ class CQL(nn.Module):
         torch.save(self.qf2.state_dict(), save_path + "/qf2" + ".pkl")
         torch.save(self.policy.state_dict(), save_path + "/policy" + ".pkl")
 
-    def save_jit(self, save_path: str) -> None:
+    def save_jit(self, save_path: str, seed:int, step:int) -> None:
         '''
         save model as JIT
         '''
         if not os.path.isdir(save_path):
             os.makedirs(save_path)
         scripted_policy = torch.jit.script(self.cpu())
-        scripted_policy.save(save_path + "/cql_model" + ".pth")
+        scripted_policy.save(save_path + "/cql_model"  + "_" +str(seed) + "_" +str(step) + ".pth")
 
     def load_net(self, load_path="saved_model/fixed_initial_budget", device='cuda:0') -> None:
         '''
@@ -231,6 +252,24 @@ class CQL(nn.Module):
         self.policy.to(self.device)
         self.target_qf1.to(self.device)
         self.target_qf2.to(self.device)
+
+    def _get_tensor_values(self, obs, actions, network=None):
+        action_shape = actions.shape[0]
+        obs_shape = obs.shape[0]
+        num_repeat = int (action_shape / obs_shape)
+        obs_temp = obs.unsqueeze(1).repeat(1, num_repeat, 1).view(obs.shape[0] * num_repeat, obs.shape[1])
+        state_action_input = torch.cat([obs_temp, actions], dim=-1)
+        preds = network(state_action_input)
+        preds = preds.view(obs.shape[0], num_repeat, 1)
+        return preds
+
+    def _get_policy_actions(self, obs, num_actions, network=None):
+        obs_temp = obs.unsqueeze(1).repeat(1, num_actions, 1).view(obs.shape[0] * num_actions, obs.shape[1])
+        new_obs_actions = network(
+            obs_temp, reparameterize=True
+        )
+        return new_obs_actions    
+
 
 if __name__ == '__main__':
     model = CQL(dim_obs=2)
@@ -254,10 +293,10 @@ if __name__ == '__main__':
                                                                                                     dtype=torch.float), torch.tensor(
             terminals, dtype=torch.float)
 
-        q_loss, v_loss, a_loss = model.step(states, actions, rewards, next_states, terminals)
-        print(f'step:{i} q_loss:{q_loss} v_loss:{v_loss} a_loss:{a_loss}')
+        q1_loss, q2_loss, a_loss = model.step(states, actions, rewards, next_states, terminals)
+
+        #print(f'step:{i} q_loss:{q_loss} v_loss:{v_loss} a_loss:{a_loss}')
 
     total_params = sum(p.numel() for p in model.parameters())
     print("Learnable parameters: {:,}".format(total_params))
-
 

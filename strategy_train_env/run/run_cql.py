@@ -8,6 +8,7 @@ import sys
 import pandas as pd
 import ast
 import pickle
+from torch.utils.tensorboard import SummaryWriter
 # Configure logging
 logging.basicConfig(level=logging.INFO,
                     format="[%(asctime)s] [%(name)s] [%(filename)s(%(lineno)d)] [%(levelname)s] %(message)s")
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 STATE_DIM = 16
 
-def train_cql_model():
+def train_cql_model(seed=1):
     """
     Train the CQL model.
     """
@@ -45,15 +46,14 @@ def train_cql_model():
     # Build replay buffer
     replay_buffer = ReplayBuffer()
     add_to_replay_buffer(replay_buffer, training_data, is_normalize)
-    print(len(replay_buffer.memory))
 
     # Train model
     model = CQL(dim_obs=STATE_DIM)
-    train_model_steps(model, replay_buffer)
+    train_model_steps(model, replay_buffer, seed=seed)
 
     # Save model
     # model.save_net("saved_model/CQLtest")
-    model.save_jit("saved_model/CQLtest")
+    #model.save_jit("saved_model/CQLtest", seed=seed, step=i)
 
     # Test trained model
     test_trained_model(model, replay_buffer)
@@ -69,13 +69,20 @@ def add_to_replay_buffer(replay_buffer, training_data, is_normalize):
             replay_buffer.push(np.array(state), np.array([action]), np.array([reward]), np.zeros_like(state),
                                np.array([done]))
 
-def train_model_steps(model, replay_buffer, step_num=100, batch_size=100):
+def train_model_steps(model, replay_buffer, step_num=100000, batch_size=100, seed=1):
     for i in range(step_num):
-        if i==8000:
-            pass
         states, actions, rewards, next_states, terminals = replay_buffer.sample(batch_size)
-        q_loss, v_loss, a_loss = model.step(states, actions, rewards, next_states, terminals)
-        logger.info(f'Step: {i} Q_loss: {q_loss} V_loss: {v_loss} A_loss: {a_loss}')
+        q1_loss, q2_loss, policy_loss = model.step(states, actions, rewards, next_states, terminals, i)
+        if i == 0:
+            writer = SummaryWriter(log_dir="tensorboard/CQL/" + str(seed))
+        writer.add_scalar('Loss/q1_loss', q1_loss, i)
+        writer.add_scalar('Loss/q2_loss', q2_loss, i)
+        writer.add_scalar('Loss/policy_loss', policy_loss, i)
+        if i == step_num - 1:
+            writer.close()
+        if i+1 % 10000 == 0:
+            model.save_jit("saved_model/CQLtest", seed=seed, step=i+1)
+        #logger.info(f'Step: {i} Q_loss: {q_loss} V_loss: {v_loss} A_loss: {a_loss}')
 
 def test_trained_model(model, replay_buffer):
     for i in range(100):
@@ -85,12 +92,11 @@ def test_trained_model(model, replay_buffer):
         tem = np.concatenate((actions, pred_actions), axis=1)
         print("concate:",tem)
 
-def run_cql():
-    print(sys.path)
+def run_cql(seed=1):
     """
     Run CQL model training and evaluation.
     """
-    train_cql_model()
+    train_cql_model(seed=seed)
 
 if __name__ == '__main__':
     run_cql()
