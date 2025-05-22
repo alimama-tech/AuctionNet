@@ -6,8 +6,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from run.run_cql import run_cql
 
-torch.manual_seed(1)
-np.random.seed(1)
+seed = 3
+torch.manual_seed(seed)
+np.random.seed(seed)
 
 if __name__ == "__main__":
-    run_cql()
+    run_cql(seed=seed)
